@@ -13,4 +13,4 @@ jobs:
         with:
           persist-credentials: false
       - run: node measure.mjs --self-test
-      - run: node measure.mjs 90
+      - run: node reference.mjs
