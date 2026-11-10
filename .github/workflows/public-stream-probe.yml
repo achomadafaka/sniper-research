@@ -1,0 +1,16 @@
+name: Public stream probe
+on:
+  push:
+    branches: ['research/public-stream-probe-*']
+permissions:
+  contents: read
+jobs:
+  observe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: node measure.mjs --self-test
+      - run: node measure.mjs 120
