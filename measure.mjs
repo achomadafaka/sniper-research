@@ -9,7 +9,13 @@ const filter = {address, topics:[topic]};
 const hex = n => '0x' + n.toString(16);
 const key = l => [l.blockHash,l.transactionHash,Number(l.logIndex)].join(':').toLowerCase();
 const wsURL = 'wss://bsc-rpc.publicnode.com';
-const referenceURLs = ['https://public.1rpc.io/bnb','https://bsc-rpc.publicnode.com'];
+const referenceURLs = [
+  'https://endpoints.omniatech.io/v1/bsc/mainnet/public',
+  'https://bnb.rpc.subquery.network/public',
+  'https://bnb-mainnet.g.alchemy.com/public',
+  'https://public.1rpc.io/bnb',
+  'https://bsc.drpc.org'
+];
 const quantile = (xs,p) => xs.length ? Math.round(xs.toSorted((a,b)=>a-b)[Math.ceil(p*xs.length)-1]) : null;
 let rid = 0;
 
@@ -47,7 +53,7 @@ async function rpc(url,method,params) {
 
 async function capture() {
   const seen = new Map(), heads = new Map(), subs = new Map();
-  const removed = new Set(), conflictingHeads = new Set();
+  const removed = new Set(), conflictingHeads = new Set(), logHeights = new Map();
   let duplicates = 0, malformed = 0, socketError = false, closed = false, chainOK = false;
   const ws = new WebSocket(wsURL);
   try {
@@ -79,7 +85,7 @@ async function capture() {
         const k = key(row);
         if (row.removed) { removed.add(k); return; }
         if (seen.has(k)) duplicates++;
-        else seen.set(k,at);
+        else { seen.set(k,at); logHeights.set(k,Number(row.blockNumber)); }
       } catch { malformed++; }
     });
     for (let i=0; i<100 && !(chainOK && subs.size === 2); i++) {
@@ -87,42 +93,69 @@ async function capture() {
       await sleep(100);
     }
     if (!chainOK || subs.size !== 2) throw new Error('websocket_chain_or_subscription_failed');
+    const startAt = performance.now();
     const start = new Date().toISOString();
-    const seconds = Number(process.argv[2] ?? 120);
+    const seconds = Number(process.argv[2] ?? 1800);
     await sleep(seconds*1000);
+    const endAt = performance.now();
     const end = new Date().toISOString();
-    const heights = [...heads.keys()].sort((a,b)=>a-b);
-    if (heights.length < 8) throw new Error('head_coverage_too_thin');
-    const lo = heights[0]+3, hi = heights.at(-1)-3;
+    await sleep(6000);
+    const window = [...heads].filter(([,h])=>h.at>=startAt && h.at<endAt).sort(([a],[b])=>a-b);
+    if (window.length < 8) throw new Error('head_coverage_too_thin');
+    const lo = window[0][0], hi = window.at(-1)[0];
+    const firstHeadDelayMs = Math.round(window[0][1].at-startAt);
+    const endHeadAgeMs = Math.round(endAt-window.at(-1)[1].at);
     for (const k of removed) seen.delete(k);
     for (const h of conflictingHeads) heads.delete(h);
     const missingHeads = Array.from({length:hi-lo+1},(_,i)=>lo+i).filter(h=>!heads.has(h)).length;
-    return {seen,heads,lo,hi,info:{start,end,seconds,headNotifications:heights.length,missingHeads,duplicates,
+    return {seen,heads,lo,hi,logHeights,info:{start,end,seconds,headNotifications:window.length,firstHeadDelayMs,endHeadAgeMs,missingHeads,duplicates,
       malformed,removed:removed.size,conflictingHeads:conflictingHeads.size,socketError,disconnected:closed}};
   } finally { if (ws.readyState < WebSocket.CLOSING) ws.close(); }
 }
 
-async function reference(refURL,lo,hi) {
-  const logs = new Map(), failures = [];
-  if (Number(await rpc(refURL,'eth_chainId',[])) !== 56) throw new Error('reference_wrong_chain');
-  for (let a=lo; a<=hi; a+=15) {
-    const b = Math.min(hi,a+14);
+async function reference(lo,hi) {
+  const logs = new Map(), gaps = [], coverage = [], errors = [];
+  const providers = [];
+  for (const url of referenceURLs) {
     try {
-      const rows = await rpc(refURL,'eth_getLogs',[{...filter,fromBlock:hex(a),toBlock:hex(b)}]);
-      if (!Array.isArray(rows) || rows.length >= 10000) throw new Error('reference_shape_or_cap');
-      const chunk = new Map();
-      for (const row of rows) {
-        const n = Number(row.blockNumber);
-        if (row.address?.toLowerCase() !== address || row.topics?.length !== 1 || row.topics[0].toLowerCase() !== topic ||
-            n<a || n>b || !Number.isSafeInteger(n) || !row.blockHash || !row.transactionHash ||
-            !Number.isSafeInteger(Number(row.logIndex)) || row.removed) throw new Error('reference_row_shape');
-        chunk.set(key(row),row);
-      }
-      for (const [k,v] of chunk) logs.set(k,v);
-    } catch (e) { failures.push([a,b,e.message]); break; }
-    await sleep(800);
+      if (Number(await rpc(url,'eth_chainId',[])) !== 56) throw new Error('wrong_chain');
+      providers.push({url,cap:200,blockedUntil:0});
+    } catch (e) { errors.push([url,'chain_id',e.message]); }
   }
-  return {logs,failures};
+  let attempts = 0;
+  async function read(a,b) {
+    for (const provider of providers) {
+      if (b-a+1 > provider.cap || Date.now() < provider.blockedUntil || attempts >= 240) continue;
+      attempts++;
+      try {
+        const rows = await rpc(provider.url,'eth_getLogs',[{...filter,fromBlock:hex(a),toBlock:hex(b)}]);
+        if (!Array.isArray(rows) || rows.length >= 10000) throw new Error('reference_shape_or_cap');
+        const chunk = new Map();
+        for (const row of rows) {
+          const n = Number(row.blockNumber);
+          if (row.address?.toLowerCase() !== address || row.topics?.length !== 1 || row.topics[0].toLowerCase() !== topic ||
+              n<a || n>b || !Number.isSafeInteger(n) || !row.blockHash || !row.transactionHash ||
+              !Number.isSafeInteger(Number(row.logIndex)) || row.removed) throw new Error('reference_row_shape');
+          chunk.set(key(row),row);
+        }
+        for (const [k,v] of chunk) logs.set(k,v);
+        coverage.push([a,b,provider.url,chunk.size]);
+        await sleep(1100);
+        return;
+      } catch (e) {
+        errors.push([provider.url,a,b,e.message]);
+        if (e.message === 'http_429' || /rate|limit.*request/i.test(e.message)) provider.blockedUntil=Date.now()+60000;
+        else if (e.message==='http_403' || e.message==='http_401' || e.message==='rpc_-32601') provider.cap=0;
+        else if (b-a+1>10) provider.cap=Math.min(provider.cap,Math.floor((b-a+1)/2));
+      }
+    }
+    if (b-a+1<=10 || attempts>=240) { gaps.push([a,b]); return; }
+    const m = Math.floor((a+b)/2);
+    await read(a,m);
+    await read(m+1,b);
+  }
+  for (let a=lo;a<=hi;a+=200) await read(a,Math.min(a+199,hi));
+  return {logs,coverage,gaps,errors,attempts};
 }
 
 if (process.argv[2] === '--self-test') {
@@ -138,29 +171,23 @@ if (process.argv[2] === '--self-test') {
   assert.equal(result.beforePlus2Head,1);
   assert.equal(result.atOrAfterPlus2Head,1);
 } else {
-  const {seen,heads,lo,hi,info} = await capture();
-  const packed = gzipSync(JSON.stringify({seen:[...seen],heads:[...heads],lo,hi,info})).toString('base64');
-  for (let i=0; i<packed.length; i+=3000) console.log('CAPTURE_B64 '+packed.slice(i,i+3000));
-  const unavailable = [];
-  let refURL, logs, failures;
-  for (const candidate of referenceURLs) {
-    try {
-      const r = await reference(candidate,lo,hi);
-      if (r.failures.length) { unavailable.push([candidate,r.failures]); continue; }
-      refURL=candidate; ({logs,failures}=r); break;
-    } catch (e) { unavailable.push([candidate,e.message]); }
+  const {seen,heads,lo,hi,info,logHeights} = await capture();
+  function publish(label, value) {
+    const packed = gzipSync(JSON.stringify(value)).toString('base64');
+    for (let i=0; i<packed.length; i+=3000) console.log(label+' '+packed.slice(i,i+3000));
   }
-  if (!logs) {
-    console.log('REFERENCE_UNAVAILABLE '+JSON.stringify({window:[lo,hi],...info,websocketDistinct:seen.size,unavailable}));
-    throw new Error('reference_unavailable');
-  }
+  publish('CAPTURE_B64',{seen:[...seen],heads:[...heads],logHeights:[...logHeights],lo,hi,info});
+  const {logs,coverage,gaps,errors,attempts} = await reference(lo,hi);
+  publish('REFERENCE_B64',{logs:[...logs].map(([k,v])=>[k,Number(v.blockNumber)]),coverage,gaps,errors,attempts});
   const chainHashMismatches = new Set();
   for (const row of logs.values()) {
     const n=Number(row.blockNumber), head=heads.get(n);
     if (head && head.hash.toLowerCase() !== row.blockHash.toLowerCase()) chainHashMismatches.add(n);
   }
   for (const n of chainHashMismatches) heads.delete(n);
-  console.log('PROBE_RESULT '+JSON.stringify({providers:{websocket:wsURL,reference:refURL},window:[lo,hi],
-    ...info, websocketDistinct:seen.size, referenceFailures:failures,unavailable,chainHashMismatches:[...chainHashMismatches],
-    ...grade(logs,seen,heads)}));
+  const covered = new Set(coverage.flatMap(([a,b])=>Array.from({length:b-a+1},(_,i)=>a+i)));
+  const websocketOnly = [...seen.keys()].filter(k=>covered.has(logHeights.get(k))&&!logs.has(k)).length;
+  console.log('PROBE_RESULT '+JSON.stringify({websocket:wsURL,window:[lo,hi],...info,
+    coveredBlocks:covered.size,websocketOnly,gaps,attempts,referenceProviders:[...new Set(coverage.map(x=>x[2]))],
+    referenceErrors:errors,chainHashMismatches:[...chainHashMismatches],...grade(logs,seen,heads)}));
 }
