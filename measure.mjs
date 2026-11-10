@@ -1,3 +1,4 @@
+import { gzipSync } from 'node:zlib';
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -8,7 +9,7 @@ const filter = {address, topics:[topic]};
 const hex = n => '0x' + n.toString(16);
 const key = l => [l.blockHash,l.transactionHash,Number(l.logIndex)].join(':').toLowerCase();
 const wsURL = 'wss://bsc-rpc.publicnode.com';
-const refURL = 'https://bsc.drpc.org';
+const referenceURLs = ['https://public.1rpc.io/bnb','https://bsc-rpc.publicnode.com'];
 const quantile = (xs,p) => xs.length ? Math.round(xs.toSorted((a,b)=>a-b)[Math.ceil(p*xs.length)-1]) : null;
 let rid = 0;
 
@@ -101,7 +102,7 @@ async function capture() {
   } finally { if (ws.readyState < WebSocket.CLOSING) ws.close(); }
 }
 
-async function reference(lo,hi) {
+async function reference(refURL,lo,hi) {
   const logs = new Map(), failures = [];
   if (Number(await rpc(refURL,'eth_chainId',[])) !== 56) throw new Error('reference_wrong_chain');
   for (let a=lo; a<=hi; a+=15) {
@@ -118,7 +119,7 @@ async function reference(lo,hi) {
         chunk.set(key(row),row);
       }
       for (const [k,v] of chunk) logs.set(k,v);
-    } catch (e) { failures.push([a,b,e.message]); }
+    } catch (e) { failures.push([a,b,e.message]); break; }
     await sleep(800);
   }
   return {logs,failures};
@@ -138,7 +139,21 @@ if (process.argv[2] === '--self-test') {
   assert.equal(result.atOrAfterPlus2Head,1);
 } else {
   const {seen,heads,lo,hi,info} = await capture();
-  const {logs,failures} = await reference(lo,hi);
+  const packed = gzipSync(JSON.stringify({seen:[...seen],heads:[...heads],lo,hi,info})).toString('base64');
+  for (let i=0; i<packed.length; i+=3000) console.log('CAPTURE_B64 '+packed.slice(i,i+3000));
+  const unavailable = [];
+  let refURL, logs, failures;
+  for (const candidate of referenceURLs) {
+    try {
+      const r = await reference(candidate,lo,hi);
+      if (r.failures.length) { unavailable.push([candidate,r.failures]); continue; }
+      refURL=candidate; ({logs,failures}=r); break;
+    } catch (e) { unavailable.push([candidate,e.message]); }
+  }
+  if (!logs) {
+    console.log('REFERENCE_UNAVAILABLE '+JSON.stringify({window:[lo,hi],...info,websocketDistinct:seen.size,unavailable}));
+    throw new Error('reference_unavailable');
+  }
   const chainHashMismatches = new Set();
   for (const row of logs.values()) {
     const n=Number(row.blockNumber), head=heads.get(n);
@@ -146,6 +161,6 @@ if (process.argv[2] === '--self-test') {
   }
   for (const n of chainHashMismatches) heads.delete(n);
   console.log('PROBE_RESULT '+JSON.stringify({providers:{websocket:wsURL,reference:refURL},window:[lo,hi],
-    ...info, websocketDistinct:seen.size, referenceFailures:failures,chainHashMismatches:[...chainHashMismatches],
+    ...info, websocketDistinct:seen.size, referenceFailures:failures,unavailable,chainHashMismatches:[...chainHashMismatches],
     ...grade(logs,seen,heads)}));
 }
